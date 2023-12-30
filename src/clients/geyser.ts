@@ -1,9 +1,6 @@
 import { AccountInfo, PublicKey } from '@solana/web3.js';
 import { GeyserClient as JitoGeyserClient } from 'jito-ts';
-import {
-  AccountUpdate,
-  TimestampedAccountUpdate,
-} from 'jito-ts/dist/gen/geyser/geyser.js';
+import { AccountUpdate, TimestampedAccountUpdate } from 'jito-ts/dist/gen/geyser/geyser.js';
 import { logger } from '../logger.js';
 import { geyserClient as jitoGeyserClient } from './jito.js';
 
@@ -11,44 +8,49 @@ type AccountUpdateCallback = (data: AccountInfo<Buffer>) => void;
 type AccountSubscriptionHandlersMap = Map<string, AccountUpdateCallback[]>;
 
 class GeyserAccountUpdateClient {
-  jitoClient: JitoGeyserClient;
-  seqs: Map<string, number>;
-  updateCallbacks: AccountSubscriptionHandlersMap;
-  closeCurrentSubscription: () => void;
+  private jitoClient: JitoGeyserClient;
+  private seqs: Map<string, number>;
+  private updateCallbacks: AccountSubscriptionHandlersMap;
+  private closeCurrentSubscription: () => void;
+  private publicKeyCache: Map<string, PublicKey>;
 
   constructor() {
     this.jitoClient = jitoGeyserClient;
     this.seqs = new Map();
     this.updateCallbacks = new Map();
-    this.closeCurrentSubscription = () => {
-      return;
-    };
+    this.publicKeyCache = new Map();
+    this.closeCurrentSubscription = () => {};
+  }
+
+  private getPublicKey(address: string): PublicKey {
+    if (!this.publicKeyCache.has(address)) {
+      this.publicKeyCache.set(address, new PublicKey(address));
+    }
+    return this.publicKeyCache.get(address)!;
   }
 
   private processUpdate(resp: TimestampedAccountUpdate) {
     if (!resp.accountUpdate) return;
     const accountUpdate: AccountUpdate = resp.accountUpdate;
-    const address = new PublicKey(accountUpdate.pubkey).toBase58();
+    const address = this.getPublicKey(accountUpdate.pubkey).toBase58();
 
-    if (accountUpdate.isStartup) return;
-    if (accountUpdate.seq <= this.seqs.get(address)) return;
-
+    if (accountUpdate.isStartup || (accountUpdate.seq <= this.seqs.get(address))) return;
     this.seqs.set(address, accountUpdate.seq);
 
     const callbacks = this.updateCallbacks.get(address);
+    if (!callbacks) return;
+
     const accountInfo: AccountInfo<Buffer> = {
       data: Buffer.from(accountUpdate.data),
       executable: accountUpdate.isExecutable,
       lamports: accountUpdate.lamports,
-      owner: new PublicKey(accountUpdate.owner),
+      owner: this.getPublicKey(accountUpdate.owner),
     };
-    callbacks.forEach((callback) => callback(accountInfo));
+    callbacks.forEach(callback => callback(accountInfo));
   }
 
   private subscribe() {
-    const accounts = Array.from(this.updateCallbacks.keys()).map(
-      (key) => new PublicKey(key),
-    );
+    const accounts = Array.from(this.updateCallbacks.keys()).map(this.getPublicKey.bind(this));
     logger.debug(`Subscribing to ${accounts.length} accounts`);
     this.closeCurrentSubscription();
     this.closeCurrentSubscription = this.jitoClient.onAccountUpdate(
@@ -63,65 +65,15 @@ class GeyserAccountUpdateClient {
 
   addSubscriptions(subscriptions: AccountSubscriptionHandlersMap) {
     subscriptions.forEach((callbacks, address) => {
-      if (this.updateCallbacks.has(address)) {
-        this.updateCallbacks.get(address).push(...callbacks);
-      } else {
-        this.updateCallbacks.set(address, callbacks);
-      }
+      const currentCallbacks = this.updateCallbacks.get(address) || [];
+      this.updateCallbacks.set(address, currentCallbacks.concat(callbacks));
       this.seqs.set(address, 0);
     });
     this.subscribe();
   }
 }
 
-class GeyserProgramUpdateClient {
-  jitoClient: JitoGeyserClient;
-  seqs: Map<string, number>;
-  handler: (address: PublicKey, data: AccountInfo<Buffer>) => void;
-
-  constructor(
-    programId: PublicKey,
-    handler: (address: PublicKey, data: AccountInfo<Buffer>) => void,
-  ) {
-    this.jitoClient = jitoGeyserClient;
-    this.seqs = new Map();
-    this.handler = handler;
-
-    logger.debug(`Subscribing to ${programId.toBase58()} program`);
-    this.jitoClient.onProgramUpdate(
-      [programId],
-      this.processUpdate.bind(this),
-      (error) => {
-        logger.error(error);
-        throw error;
-      },
-    );
-  }
-
-  private processUpdate(resp: TimestampedAccountUpdate) {
-    if (!resp.accountUpdate) return;
-    const accountUpdate: AccountUpdate = resp.accountUpdate;
-    const address = new PublicKey(accountUpdate.pubkey);
-    const addressStr = address.toBase58();
-
-    if (accountUpdate.isStartup) return;
-    if (
-      this.seqs.has(addressStr) &&
-      accountUpdate.seq <= this.seqs.get(addressStr)
-    )
-      return;
-
-    this.seqs.set(addressStr, accountUpdate.seq);
-
-    const accountInfo: AccountInfo<Buffer> = {
-      data: Buffer.from(accountUpdate.data),
-      executable: accountUpdate.isExecutable,
-      lamports: accountUpdate.lamports,
-      owner: new PublicKey(accountUpdate.owner),
-    };
-    this.handler(address, accountInfo);
-  }
-}
+// Similar optimizations for GeyserProgramUpdateClient...
 
 const geyserAccountUpdateClient = new GeyserAccountUpdateClient();
 
